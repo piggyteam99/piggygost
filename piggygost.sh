@@ -4,7 +4,6 @@ set -euo pipefail
 BIN="/usr/local/bin/gost"
 CFG_DIR="/etc/piggytun"
 SVC_DIR="/etc/systemd/system"
-MARK="# PIGGYTUN-GOST"
 
 mkdir -p "$CFG_DIR"
 
@@ -13,55 +12,100 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
+################################
+# CHECK GOST VALID INSTALL
+################################
+gost_valid() {
+
+  if [[ ! -f "$BIN" ]]; then
+    return 1
+  fi
+
+  if [[ ! -x "$BIN" ]]; then
+    return 1
+  fi
+
+  if [[ ! -s "$BIN" ]]; then
+    return 1
+  fi
+
+  if ! "$BIN" -V >/dev/null 2>&1; then
+    return 1
+  fi
+
+  return 0
+}
+
+################################
+# INSTALL GOST
+################################
 install_gost() {
 
-  if command -v gost >/dev/null 2>&1; then
-    echo "GOST already installed"
+  if gost_valid; then
+    echo "GOST already installed and valid"
     return
   fi
 
   echo "Installing GOST..."
 
+  rm -f "$BIN"
+
   ARCH=$(uname -m)
   GOST_VERSION="2.11.5"
 
   case "$ARCH" in
-    x86_64) URL="https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/gost-linux-amd64-${GOST_VERSION}.gz" ;;
-    aarch64) URL="https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/gost-linux-armv8-${GOST_VERSION}.gz" ;;
-    *) echo "Unsupported arch"; exit 1 ;;
+    x86_64)
+      URL="https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/gost-linux-amd64-${GOST_VERSION}.gz"
+      ;;
+    aarch64)
+      URL="https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/gost-linux-armv8-${GOST_VERSION}.gz"
+      ;;
+    *)
+      echo "Unsupported arch"
+      exit 1
+      ;;
   esac
 
-  echo "Downloading from: $URL"
-  wget -O /tmp/gost.gz "$URL"
+  TMP="/tmp/gost.gz"
 
-  # بررسی اینکه آیا فایل با موفقیت دانلود شده است یا خیر
-  if [[ ! -s /tmp/gost.gz ]]; then
-    echo "Error: Failed to download GOST. (خطا در دانلود)"
+  echo "Downloading..."
+  wget -q -O "$TMP" "$URL"
+
+  if [[ ! -s "$TMP" ]]; then
+    echo "Download failed"
     exit 1
   fi
 
-  echo "Extracting GOST..."
-  # خارج کردن از حالت فشرده
-  gzip -fd /tmp/gost.gz
-  
-  # انتقال به مسیر باینری و دادن دسترسی اجرا
+  echo "Extracting..."
+  gzip -f -d "$TMP"
+
   mv /tmp/gost "$BIN"
   chmod +x "$BIN"
 
-  echo "GOST installed successfully!"
+  if gost_valid; then
+    echo "GOST installed successfully"
+  else
+    echo "Install failed"
+    exit 1
+  fi
 }
 
+################################
 ask() {
   read -rp "$1: " v
   echo "$v"
 }
 
+################################
 restart_service() {
+
   systemctl daemon-reload
-  systemctl restart "$1"
   systemctl enable "$1"
+  systemctl restart "$1"
+
 }
 
+################################
 add_tunnel_kharej() {
 
   install_gost
@@ -75,7 +119,6 @@ add_tunnel_kharej() {
   for ((i=0;i<count;i++)); do
 
     port=$((range_start+i))
-
     svc="piggytun-kharej-$port.service"
 
     cat > "$SVC_DIR/$svc" <<EOF
@@ -84,6 +127,7 @@ Description=PIGGYTUN KHAREJ $port
 After=network.target
 
 [Service]
+Type=simple
 ExecStart=$BIN -L=tcp://:$port/127.0.0.1:$dest_port
 Restart=always
 RestartSec=3
@@ -98,9 +142,10 @@ EOF
 
   echo "$id" > "$CFG_DIR/$id"
 
-  echo "KHAREJ aggregation tunnel created"
+  echo "KHAREJ tunnel created"
 }
 
+################################
 add_tunnel_iran() {
 
   install_gost
@@ -129,6 +174,7 @@ Description=PIGGYTUN IRAN Aggregator
 After=network.target
 
 [Service]
+Type=simple
 ExecStart=$BIN -L=tcp://:$main_port $FORWARD
 Restart=always
 RestartSec=3
@@ -141,16 +187,25 @@ EOF
 
   echo "$id" > "$CFG_DIR/$id"
 
-  echo "IRAN aggregation tunnel created"
+  echo "IRAN tunnel created"
 }
 
+################################
 list_tunnels() {
 
+  echo
   echo "Installed tunnels:"
-  ls "$CFG_DIR" | nl || true
+
+  if [[ -z "$(ls -A "$CFG_DIR")" ]]; then
+    echo "None"
+    return
+  fi
+
+  ls "$CFG_DIR" | nl
 
 }
 
+################################
 remove_tunnel() {
 
   list_tunnels
@@ -161,7 +216,7 @@ remove_tunnel() {
 
   if [[ -z "$id" ]]; then
     echo "Invalid"
-    exit 1
+    return
   fi
 
   if [[ "$id" == IRAN* ]]; then
@@ -169,8 +224,8 @@ remove_tunnel() {
     port=$(echo "$id" | cut -d_ -f2)
     svc="piggytun-iran-$port.service"
 
-    systemctl stop "$svc"
-    systemctl disable "$svc"
+    systemctl stop "$svc" 2>/dev/null || true
+    systemctl disable "$svc" 2>/dev/null || true
     rm -f "$SVC_DIR/$svc"
 
   fi
@@ -185,8 +240,8 @@ remove_tunnel() {
       port=$((start+i))
       svc="piggytun-kharej-$port.service"
 
-      systemctl stop "$svc"
-      systemctl disable "$svc"
+      systemctl stop "$svc" 2>/dev/null || true
+      systemctl disable "$svc" 2>/dev/null || true
       rm -f "$SVC_DIR/$svc"
 
     done
@@ -200,19 +255,34 @@ remove_tunnel() {
   echo "Removed"
 }
 
+################################
 remove_all() {
 
-  systemctl stop piggytun-* 2>/dev/null || true
+  echo "Removing all piggytun services..."
 
-  rm -f $SVC_DIR/piggytun-* 2>/dev/null || true
+  for svc in "$SVC_DIR"/piggytun-*.service; do
+
+    [[ -e "$svc" ]] || continue
+
+    name=$(basename "$svc")
+
+    systemctl stop "$name" 2>/dev/null || true
+    systemctl disable "$name" 2>/dev/null || true
+
+    rm -f "$svc"
+
+  done
+
   rm -rf "$CFG_DIR"
   mkdir -p "$CFG_DIR"
 
   systemctl daemon-reload
-  echo "All removed"
+
+  echo "All removed successfully"
 
 }
 
+################################
 iran_menu() {
 
   while true; do
@@ -227,13 +297,14 @@ iran_menu() {
 
     c=$(ask "Choice")
 
-    case $c in
+    case "$c" in
 
       1) install_gost ;;
       2) add_tunnel_iran ;;
       3) list_tunnels ;;
       4) remove_tunnel ;;
       5) break ;;
+      *) echo "Invalid" ;;
 
     esac
 
@@ -241,6 +312,7 @@ iran_menu() {
 
 }
 
+################################
 kharej_menu() {
 
   while true; do
@@ -255,13 +327,14 @@ kharej_menu() {
 
     c=$(ask "Choice")
 
-    case $c in
+    case "$c" in
 
       1) install_gost ;;
       2) add_tunnel_kharej ;;
       3) list_tunnels ;;
       4) remove_tunnel ;;
       5) break ;;
+      *) echo "Invalid" ;;
 
     esac
 
@@ -269,6 +342,7 @@ kharej_menu() {
 
 }
 
+################################
 echo
 echo "PIGGYTUN GOST Aggregation"
 echo "1) IRAN SERVER"
@@ -277,12 +351,11 @@ echo "3) REMOVE ALL"
 
 main=$(ask "Select")
 
-case $main in
+case "$main" in
 
   1) iran_menu ;;
   2) kharej_menu ;;
   3) remove_all ;;
-
   *) echo "Invalid" ;;
 
 esac
