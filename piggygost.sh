@@ -4,14 +4,37 @@ set -euo pipefail
 BIN="/usr/local/bin/gost"
 CFG_DIR="/etc/piggytun"
 SVC_DIR="/etc/systemd/system"
-MARK="# PIGGYTUN-GOST"
+TMP_DIR="/tmp/gost-install"
 
 mkdir -p "$CFG_DIR"
+mkdir -p "$TMP_DIR"
 
 if [[ $EUID -ne 0 ]]; then
   echo "Run as root"
   exit 1
 fi
+
+################################
+# Detect architecture
+################################
+
+detect_arch() {
+
+case "$(uname -m)" in
+x86_64) echo "amd64" ;;
+aarch64|arm64) echo "arm64" ;;
+armv7l) echo "armv7" ;;
+*)
+echo "Unsupported architecture"
+exit 1
+;;
+esac
+
+}
+
+################################
+# Install gost from official GitHub releases
+################################
 
 install_gost() {
 
@@ -22,29 +45,59 @@ fi
 
 echo "Installing GOST..."
 
-ARCH=$(uname -m)
+ARCH=$(detect_arch)
 
-case "$ARCH" in
-x86_64) URL="https://github.com/go-gost/gost/releases/latest/download/gost-linux-amd64" ;;
-aarch64) URL="https://github.com/go-gost/gost/releases/latest/download/gost-linux-arm64" ;;
-*) echo "Unsupported arch"; exit 1 ;;
-esac
+LATEST=$(curl -s https://api.github.com/repos/go-gost/gost/releases/latest | grep tag_name | cut -d '"' -f4)
 
-wget -O "$BIN" "$URL"
+FILE="gost_${LATEST#v}_linux_${ARCH}.tar.gz"
+
+URL="https://github.com/go-gost/gost/releases/download/${LATEST}/${FILE}"
+
+echo "Downloading $URL"
+
+if ! curl -L "$URL" -o "$TMP_DIR/gost.tar.gz"; then
+echo "Download failed"
+exit 1
+fi
+
+cd "$TMP_DIR"
+
+tar -xzf gost.tar.gz
+
+cp gost "$BIN"
+
 chmod +x "$BIN"
 
+rm -rf "$TMP_DIR"
+
+echo "GOST installed successfully"
+
 }
+
+################################
+# Ask input
+################################
 
 ask() {
 read -rp "$1: " v
 echo "$v"
 }
 
-restart_service() {
+################################
+# Restart service
+################################
+
+enable_service() {
+
 systemctl daemon-reload
-systemctl restart "$1"
 systemctl enable "$1"
+systemctl restart "$1"
+
 }
+
+################################
+# Add KHAREJ aggregation server
+################################
 
 add_tunnel_kharej() {
 
@@ -64,10 +117,11 @@ svc="piggytun-kharej-$port.service"
 
 cat > "$SVC_DIR/$svc" <<EOF
 [Unit]
-Description=PIGGYTUN KHAREJ $port
+Description=PIGGYTUN KHAREJ PORT $port
 After=network.target
 
 [Service]
+Type=simple
 ExecStart=$BIN -L=tcp://:$port/127.0.0.1:$dest_port
 Restart=always
 RestartSec=3
@@ -76,14 +130,19 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-restart_service "$svc"
+enable_service "$svc"
 
 done
 
 echo "$id" > "$CFG_DIR/$id"
 
 echo "KHAREJ aggregation tunnel created"
+
 }
+
+################################
+# Add IRAN aggregation client
+################################
 
 add_tunnel_iran() {
 
@@ -101,6 +160,7 @@ FORWARD=""
 for ((i=0;i<count;i++)); do
 
 port=$((range_start+i))
+
 FORWARD="$FORWARD -F=tcp://$kharej_ip:$port"
 
 done
@@ -109,10 +169,11 @@ svc="piggytun-iran-$main_port.service"
 
 cat > "$SVC_DIR/$svc" <<EOF
 [Unit]
-Description=PIGGYTUN IRAN Aggregator
+Description=PIGGYTUN IRAN Aggregator $main_port
 After=network.target
 
 [Service]
+Type=simple
 ExecStart=$BIN -L=tcp://:$main_port $FORWARD
 Restart=always
 RestartSec=3
@@ -121,19 +182,29 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-restart_service "$svc"
+enable_service "$svc"
 
 echo "$id" > "$CFG_DIR/$id"
 
 echo "IRAN aggregation tunnel created"
+
 }
+
+################################
+# List tunnels
+################################
 
 list_tunnels() {
 
+echo
 echo "Installed tunnels:"
 ls "$CFG_DIR" | nl || true
 
 }
+
+################################
+# Remove tunnel
+################################
 
 remove_tunnel() {
 
@@ -144,17 +215,19 @@ num=$(ask "Enter number")
 id=$(ls "$CFG_DIR" | sed -n "${num}p")
 
 if [[ -z "$id" ]]; then
-echo "Invalid"
+echo "Invalid selection"
 exit 1
 fi
 
 if [[ "$id" == IRAN* ]]; then
 
 port=$(echo "$id" | cut -d_ -f2)
+
 svc="piggytun-iran-$port.service"
 
 systemctl stop "$svc"
 systemctl disable "$svc"
+
 rm -f "$SVC_DIR/$svc"
 
 fi
@@ -167,10 +240,12 @@ count=$(echo "$id" | cut -d_ -f3)
 for ((i=0;i<count;i++)); do
 
 port=$((start+i))
+
 svc="piggytun-kharej-$port.service"
 
 systemctl stop "$svc"
 systemctl disable "$svc"
+
 rm -f "$SVC_DIR/$svc"
 
 done
@@ -181,19 +256,29 @@ rm -f "$CFG_DIR/$id"
 
 systemctl daemon-reload
 
-echo "Removed"
+echo "Tunnel removed"
+
 }
+
+################################
+# Remove all
+################################
 
 remove_all() {
 
 systemctl stop piggytun-* 2>/dev/null || true
 
 rm -f $SVC_DIR/piggytun-* 2>/dev/null || true
+
 rm -rf "$CFG_DIR"
 
-echo "All removed"
+echo "All tunnels removed"
 
 }
+
+################################
+# Menus
+################################
 
 iran_menu() {
 
@@ -210,13 +295,11 @@ echo "5) Back"
 c=$(ask "Choice")
 
 case $c in
-
 1) install_gost ;;
 2) add_tunnel_iran ;;
 3) list_tunnels ;;
 4) remove_tunnel ;;
 5) break ;;
-
 esac
 
 done
@@ -238,21 +321,23 @@ echo "5) Back"
 c=$(ask "Choice")
 
 case $c in
-
 1) install_gost ;;
 2) add_tunnel_kharej ;;
 3) list_tunnels ;;
 4) remove_tunnel ;;
 5) break ;;
-
 esac
 
 done
 
 }
 
+################################
+# Main menu
+################################
+
 echo
-echo "PIGGYTUN GOST Aggregation"
+echo "PIGGYTUN GOST BANDWIDTH AGGREGATION"
 echo "1) IRAN SERVER"
 echo "2) KHAREJ SERVER"
 echo "3) REMOVE ALL"
@@ -260,11 +345,10 @@ echo "3) REMOVE ALL"
 main=$(ask "Select")
 
 case $main in
-
 1) iran_menu ;;
 2) kharej_menu ;;
 3) remove_all ;;
-
-*) echo "Invalid" ;;
-
+*)
+echo "Invalid"
+;;
 esac
