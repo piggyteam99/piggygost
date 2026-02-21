@@ -1,361 +1,270 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
 
-BIN="/usr/local/bin/gost"
-CFG_DIR="/etc/piggytun"
-SVC_DIR="/etc/systemd/system"
+# ==========================================
+# Gost Bandwidth Aggregation Tunnel Script
+# ==========================================
 
-mkdir -p "$CFG_DIR"
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
 
-if [[ $EUID -ne 0 ]]; then
-  echo "Run as root (با دسترسی روت اجرا کنید)"
-  exit 1
+if [ "$EUID" -ne 0 ]; then
+  echo -e "${RED}لطفا اسکریپت را با دسترسی Root (sudo) اجرا کنید.${NC}"
+  exit
 fi
 
-################################
-# CHECK GOST VALID INSTALL
-################################
-gost_valid() {
+install_prerequisites() {
+    clear
+    echo -e "${CYAN}در حال نصب پیش‌نیازها و دانلود Gost...${NC}"
+    apt-get update
+    apt-get install -y wget curl jq tar ufw net-tools
 
-  if [[ ! -f "$BIN" ]]; then
-    return 1
-  fi
-
-  if [[ ! -x "$BIN" ]]; then
-    return 1
-  fi
-
-  if [[ ! -s "$BIN" ]]; then
-    return 1
-  fi
-
-  if ! "$BIN" -V >/dev/null 2>&1; then
-    return 1
-  fi
-
-  return 0
+    if [ -f "/usr/local/bin/gost" ]; then
+        echo -e "${GREEN}Gost از قبل نصب شده است.${NC}"
+    else
+        echo -e "${YELLOW}در حال دانلود آخرین نسخه Gost V2...${NC}"
+        wget https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz -O gost.gz
+        gzip -d gost.gz
+        mv gost /usr/local/bin/gost
+        chmod +x /usr/local/bin/gost
+        echo -e "${GREEN}نصب Gost با موفقیت انجام شد.${NC}"
+    fi
+    sleep 2
 }
 
-################################
-# INSTALL GOST
-################################
-install_gost() {
+setup_iran_tunnel() {
+    clear
+    echo -e "${CYAN}--- تنظیم تانل در سرور ایران ---${NC}"
+    read -p "پورت داخلی (پورتی که در ایران به آن وصل میشوید) را وارد کنید: " LOCAL_PORT
+    read -p "آی‌پی (IP) سرور خارج را وارد کنید: " FOREIGN_IP
+    read -p "شروع رنج پورت (مثلا 20000): " RANGE_START
+    read -p "پایان رنج پورت (مثلا 20050): " RANGE_END
 
-  if gost_valid; then
-    echo "GOST already installed and valid"
-    return
-  fi
-
-  echo "Installing GOST..."
-
-  rm -f "$BIN"
-
-  ARCH=$(uname -m)
-  GOST_VERSION="2.11.5"
-
-  case "$ARCH" in
-    x86_64)
-      URL="https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/gost-linux-amd64-${GOST_VERSION}.gz"
-      ;;
-    aarch64)
-      URL="https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/gost-linux-armv8-${GOST_VERSION}.gz"
-      ;;
-    *)
-      echo "Unsupported arch"
-      exit 1
-      ;;
-  esac
-
-  TMP="/tmp/gost.gz"
-
-  echo "Downloading..."
-  wget -q -O "$TMP" "$URL"
-
-  if [[ ! -s "$TMP" ]]; then
-    echo "Download failed"
-    exit 1
-  fi
-
-  echo "Extracting..."
-  gzip -f -d "$TMP"
-
-  mv /tmp/gost "$BIN"
-  chmod +x "$BIN"
-
-  if gost_valid; then
-    echo "GOST installed successfully"
-  else
-    echo "Install failed"
-    exit 1
-  fi
-}
-
-################################
-ask() {
-  read -rp "$1: " v
-  echo "$v"
-}
-
-################################
-restart_service() {
-
-  systemctl daemon-reload
-  systemctl enable "$1"
-  systemctl restart "$1"
-
-}
-
-################################
-add_tunnel_kharej() {
-
-  install_gost
-
-  range_start=$(ask "Port range start")
-  count=$(ask "Port count")
-  dest_port=$(ask "Destination local port")
-
-  id="KHAREJ_${range_start}_${count}_${dest_port}"
-
-  for ((i=0;i<count;i++)); do
-
-    port=$((range_start+i))
-    svc="piggytun-kharej-$port.service"
-
-    cat > "$SVC_DIR/$svc" <<EOF
-[Unit]
-Description=PIGGYTUN KHAREJ $port
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=$BIN -L=tcp://:$port/127.0.0.1:$dest_port
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    restart_service "$svc"
-
-  done
-
-  echo "$id" > "$CFG_DIR/$id"
-
-  echo "KHAREJ tunnel created"
-}
-
-################################
-add_tunnel_iran() {
-
-  install_gost
-
-  main_port=$(ask "Main listen port")
-  range_start=$(ask "Port range start")
-  count=$(ask "Port count")
-  kharej_ip=$(ask "Kharej IP")
-
-  id="IRAN_${main_port}_${range_start}_${count}"
-
-  FORWARD=""
-
-  for ((i=0;i<count;i++)); do
-
-    port=$((range_start+i))
-    FORWARD="$FORWARD -F=tcp://$kharej_ip:$port"
-
-  done
-
-  svc="piggytun-iran-$main_port.service"
-
-  cat > "$SVC_DIR/$svc" <<EOF
-[Unit]
-Description=PIGGYTUN IRAN Aggregator
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=$BIN -L=tcp://:$main_port $FORWARD
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  restart_service "$svc"
-
-  echo "$id" > "$CFG_DIR/$id"
-
-  echo "IRAN tunnel created"
-}
-
-################################
-list_tunnels() {
-
-  echo
-  echo "Installed tunnels:"
-
-  if [[ -z "$(ls -A "$CFG_DIR")" ]]; then
-    echo "None"
-    return
-  fi
-
-  ls "$CFG_DIR" | nl
-
-}
-
-################################
-remove_tunnel() {
-
-  list_tunnels
-
-  num=$(ask "Enter number")
-
-  id=$(ls "$CFG_DIR" | sed -n "${num}p")
-
-  if [[ -z "$id" ]]; then
-    echo "Invalid"
-    return
-  fi
-
-  if [[ "$id" == IRAN* ]]; then
-
-    port=$(echo "$id" | cut -d_ -f2)
-    svc="piggytun-iran-$port.service"
-
-    systemctl stop "$svc" 2>/dev/null || true
-    systemctl disable "$svc" 2>/dev/null || true
-    rm -f "$SVC_DIR/$svc"
-
-  fi
-
-  if [[ "$id" == KHAREJ* ]]; then
-
-    start=$(echo "$id" | cut -d_ -f2)
-    count=$(echo "$id" | cut -d_ -f3)
-
-    for ((i=0;i<count;i++)); do
-
-      port=$((start+i))
-      svc="piggytun-kharej-$port.service"
-
-      systemctl stop "$svc" 2>/dev/null || true
-      systemctl disable "$svc" 2>/dev/null || true
-      rm -f "$SVC_DIR/$svc"
-
+    echo -e "${YELLOW}در حال ساخت کانفیگ تجمیع پهنای باند...${NC}"
+    
+    F_STR=""
+    for (( p=$RANGE_START; p<=$RANGE_END; p++ )); do
+        if [ -z "$F_STR" ]; then
+            F_STR="mws://${FOREIGN_IP}:${p}?strategy=round"
+        else
+            F_STR="${F_STR},mws://${FOREIGN_IP}:${p}"
+        fi
     done
 
-  fi
+    SERVICE_NAME="gost-ir-${LOCAL_PORT}.service"
+    SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 
-  rm -f "$CFG_DIR/$id"
+    cat <<EOF > $SERVICE_FILE
+[Unit]
+Description=Gost Iran Tunnel Port ${LOCAL_PORT}
+After=network.target
 
-  systemctl daemon-reload
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gost -L tcp://0.0.0.0:${LOCAL_PORT} -F "${F_STR}"
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
 
-  echo "Removed"
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable $SERVICE_NAME
+    systemctl start $SERVICE_NAME
+
+    # Allow Firewall
+    ufw allow $LOCAL_PORT/tcp >/dev/null 2>&1
+
+    echo -e "${GREEN}تانل ایران با موفقیت ساخته و استارت شد!${NC}"
+    echo -e "پورت ورودی شما: ${CYAN}${LOCAL_PORT}${NC}"
+    echo -e "ارسال ترافیک به سرور خارج روی رنج پورت: ${CYAN}${RANGE_START} تا ${RANGE_END}${NC}"
+    sleep 4
 }
 
-################################
-remove_all() {
+setup_kharej_tunnel() {
+    clear
+    echo -e "${CYAN}--- تنظیم تانل در سرور خارج ---${NC}"
+    read -p "پورت خارجی (پورتی که کانفیگ V2ray/Xray شما روی آن است) را وارد کنید: " TARGET_PORT
+    read -p "شروع رنج پورت (باید دقیقا با ایران یکی باشد - مثلا 20000): " RANGE_START
+    read -p "پایان رنج پورت (باید دقیقا با ایران یکی باشد - مثلا 20050): " RANGE_END
 
-  echo "Removing all piggytun services..."
+    echo -e "${YELLOW}در حال ساخت کانفیگ دریافت رنج پورت...${NC}"
 
-  for svc in "$SVC_DIR"/piggytun-*.service; do
+    L_STR=""
+    for (( p=$RANGE_START; p<=$RANGE_END; p++ )); do
+        L_STR="${L_STR} -L mws://0.0.0.0:${p}/127.0.0.1:${TARGET_PORT}"
+        ufw allow $p/tcp >/dev/null 2>&1
+    done
 
-    [[ -e "$svc" ]] || continue
+    SERVICE_NAME="gost-kh-${TARGET_PORT}.service"
+    SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 
-    name=$(basename "$svc")
+    cat <<EOF > $SERVICE_FILE
+[Unit]
+Description=Gost Kharej Tunnel Target Port ${TARGET_PORT}
+After=network.target
 
-    systemctl stop "$name" 2>/dev/null || true
-    systemctl disable "$name" 2>/dev/null || true
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gost ${L_STR}
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
 
-    rm -f "$svc"
+[Install]
+WantedBy=multi-user.target
+EOF
 
-  done
+    systemctl daemon-reload
+    systemctl enable $SERVICE_NAME
+    systemctl start $SERVICE_NAME
 
-  rm -rf "$CFG_DIR"
-  mkdir -p "$CFG_DIR"
-
-  systemctl daemon-reload
-
-  echo "All removed successfully"
-
+    echo -e "${GREEN}تانل خارج با موفقیت ساخته و استارت شد!${NC}"
+    echo -e "دریافت از ایران روی رنج پورت: ${CYAN}${RANGE_START} تا ${RANGE_END}${NC}"
+    echo -e "ارسال ترافیک تجمیع شده به پورت محلی: ${CYAN}${TARGET_PORT}${NC}"
+    sleep 4
 }
 
-################################
-iran_menu() {
+manage_tunnels() {
+    clear
+    echo -e "${CYAN}--- لیست تانل‌های فعال ---${NC}"
+    
+    files=(/etc/systemd/system/gost-*.service)
+    
+    if [ ! -e "${files[0]}" ]; then
+        echo -e "${RED}هیچ تانلی یافت نشد!${NC}"
+        sleep 2
+        return
+    fi
 
-  while true; do
+    echo "تانل های پیدا شده:"
+    count=1
+    for f in "${files[@]}"; do
+        filename=$(basename -- "$f")
+        status=$(systemctl is-active "$filename")
+        if [ "$status" == "active" ]; then
+            echo -e "${count}) ${filename} - [${GREEN}فعال${NC}]"
+        else
+            echo -e "${count}) ${filename} - [${RED}غیرفعال${NC}]"
+        fi
+        ((count++))
+    done
 
-    echo
-    echo "IRAN MENU"
-    echo "1) Install GOST"
-    echo "2) Add Aggregation Tunnel"
-    echo "3) List Tunnels"
-    echo "4) Remove Tunnel"
-    echo "5) Back"
+    echo -e "\n${YELLOW}گزینه ها:${NC}"
+    echo "1) حذف یک تانل"
+    echo "0) بازگشت به منوی قبل"
+    read -p "انتخاب شما: " choice
 
-    c=$(ask "Choice")
+    if [ "$choice" == "1" ]; then
+        read -p "شماره تانلی که میخواهید حذف کنید را وارد کنید: " del_num
+        if [[ $del_num -gt 0 && $del_num -lt $count ]]; then
+            idx=$((del_num-1))
+            target_file="${files[$idx]}"
+            target_name=$(basename -- "$target_file")
+            
+            systemctl stop "$target_name"
+            systemctl disable "$target_name"
+            rm "$target_file"
+            systemctl daemon-reload
+            echo -e "${GREEN}تانل $target_name با موفقیت حذف شد.${NC}"
+            sleep 2
+        else
+            echo -e "${RED}شماره نامعتبر است.${NC}"
+            sleep 2
+        fi
+    fi
+}
 
-    case "$c" in
+uninstall_all() {
+    clear
+    echo -e "${RED}هشدار: این کار تمام تانل‌ها و خود نرم‌افزار Gost را پاک می‌کند.${NC}"
+    read -p "آیا مطمئن هستید؟ (y/n): " confirm
+    if [ "$confirm" == "y" ] || [ "$confirm" == "Y" ]; then
+        echo -e "${YELLOW}در حال متوقف کردن سرویس‌ها...${NC}"
+        for f in /etc/systemd/system/gost-*.service; do
+            if [ -e "$f" ]; then
+                name=$(basename -- "$f")
+                systemctl stop "$name"
+                systemctl disable "$name"
+                rm "$f"
+            fi
+        done
+        systemctl daemon-reload
+        rm -f /usr/local/bin/gost
+        echo -e "${GREEN}حذف کامل با موفقیت انجام شد.${NC}"
+        sleep 2
+        exit
+    fi
+}
 
-      1) install_gost ;;
-      2) add_tunnel_iran ;;
-      3) list_tunnels ;;
-      4) remove_tunnel ;;
-      5) break ;;
-      *) echo "Invalid" ;;
+menu_iran() {
+    while true; do
+        clear
+        echo -e "${GREEN}====== منوی سرور ایران ======${NC}"
+        echo "1) نصب پیش‌نیازها و Gost"
+        echo "2) ساخت تانل جدید (Bandwidth Aggregation)"
+        echo "3) مشاهده و حذف تانل‌ها"
+        echo "4) حذف کامل اسکریپت و تانل‌ها"
+        echo "0) بازگشت به منوی اصلی"
+        echo -e "${GREEN}=============================${NC}"
+        read -p "لطفا یک گزینه را انتخاب کنید: " choice
 
+        case $choice in
+            1) install_prerequisites ;;
+            2) setup_iran_tunnel ;;
+            3) manage_tunnels ;;
+            4) uninstall_all ;;
+            0) break ;;
+            *) echo -e "${RED}گزینه نامعتبر!${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+menu_kharej() {
+    while true; do
+        clear
+        echo -e "${BLUE}====== منوی سرور خارج ======${NC}"
+        echo "1) نصب پیش‌نیازها و Gost"
+        echo "2) ساخت تانل جدید (دریافت رنج پورت)"
+        echo "3) مشاهده و حذف تانل‌ها"
+        echo "4) حذف کامل اسکریپت و تانل‌ها"
+        echo "0) بازگشت به منوی اصلی"
+        echo -e "${BLUE}============================${NC}"
+        read -p "لطفا یک گزینه را انتخاب کنید: " choice
+
+        case $choice in
+            1) install_prerequisites ;;
+            2) setup_kharej_tunnel ;;
+            3) manage_tunnels ;;
+            4) uninstall_all ;;
+            0) break ;;
+            *) echo -e "${RED}گزینه نامعتبر!${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# Main Loop
+while true; do
+    clear
+    echo -e "${YELLOW}==================================================${NC}"
+    echo -e "${CYAN} Gost Bandwidth Aggregation Tunnel Manager ${NC}"
+    echo -e "${YELLOW}==================================================${NC}"
+    echo -e "این سرور در کجا قرار دارد؟"
+    echo "1) سرور ایران (مبدا)"
+    echo "2) سرور خارج (مقصد)"
+    echo "0) خروج از اسکریپت"
+    echo -e "${YELLOW}==================================================${NC}"
+    read -p "انتخاب شما: " server_type
+
+    case $server_type in
+        1) menu_iran ;;
+        2) menu_kharej ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}گزینه نامعتبر!${NC}"; sleep 1 ;;
     esac
-
-  done
-
-}
-
-################################
-kharej_menu() {
-
-  while true; do
-
-    echo
-    echo "KHAREJ MENU"
-    echo "1) Install GOST"
-    echo "2) Add Aggregation Tunnel"
-    echo "3) List Tunnels"
-    echo "4) Remove Tunnel"
-    echo "5) Back"
-
-    c=$(ask "Choice")
-
-    case "$c" in
-
-      1) install_gost ;;
-      2) add_tunnel_kharej ;;
-      3) list_tunnels ;;
-      4) remove_tunnel ;;
-      5) break ;;
-      *) echo "Invalid" ;;
-
-    esac
-
-  done
-
-}
-
-################################
-echo
-echo "PIGGYTUN GOST Aggregation"
-echo "1) IRAN SERVER"
-echo "2) KHAREJ SERVER"
-echo "3) REMOVE ALL"
-
-main=$(ask "Select")
-
-case "$main" in
-
-  1) iran_menu ;;
-  2) kharej_menu ;;
-  3) remove_all ;;
-  *) echo "Invalid" ;;
-
-esac
+done
